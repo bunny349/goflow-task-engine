@@ -1,0 +1,79 @@
+// Package api exposes an HTTP interface to enqueue tasks and observe queue
+// health (pending/processing/dead-letter counts) — the "monitoring UI" a
+// production task queue needs.
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/YOUR_USERNAME/taskqueue/internal/queue"
+)
+
+type Server struct {
+	q *queue.Queue
+}
+
+func NewServer(q *queue.Queue) *Server {
+	return &Server{q: q}
+}
+
+func (s *Server) Routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("POST /api/tasks", s.handleEnqueue)
+	mux.HandleFunc("GET /api/stats", s.handleStats)
+	return mux
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+type enqueueRequest struct {
+	Type       string          `json:"type"`
+	Payload    json.RawMessage `json:"payload"`
+	MaxRetries int             `json:"max_retries"`
+}
+
+type enqueueResponse struct {
+	ID string `json:"id"`
+}
+
+func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
+	var req enqueueRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Type == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "'type' is required"})
+		return
+	}
+	if req.MaxRetries <= 0 {
+		req.MaxRetries = 3
+	}
+
+	id, err := s.q.Enqueue(r.Context(), req.Type, req.Payload, req.MaxRetries)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, enqueueResponse{ID: id})
+}
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.q.Stats(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
