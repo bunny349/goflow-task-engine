@@ -1,0 +1,238 @@
+// Package queue implements a reliable, Redis-backed task queue using the
+// "reliable queue" pattern: tasks move from a pending list to a
+// worker-specific processing list atomically (RPOPLPUSH), are acknowledged
+// (removed) on success, and are requeued with exponential backoff on
+// failure. After MaxRetries failed attempts, a task is moved to a
+// dead-letter queue for manual inspection instead of being retried forever.
+package queue
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	pendingKeyFmt    = "taskqueue:%s:pending"     // Redis LIST — FIFO of ready tasks
+	processingKeyFmt = "taskqueue:%s:processing:%s" // Redis LIST — tasks a specific worker is running
+	delayedKey       = "taskqueue:delayed"        // Redis ZSET — score = unix ts when task becomes ready
+	deadLetterKey    = "taskqueue:dead_letter"     // Redis LIST — tasks that exhausted all retries
+	statsKey         = "taskqueue:stats"           // Redis HASH — counters (enqueued/completed/failed/dead_letter)
+)
+
+// Status values a Task can be in, primarily useful for observability.
+type Status string
+
+const (
+	StatusPending    Status = "pending"
+	StatusProcessing Status = "processing"
+	StatusCompleted  Status = "completed"
+	StatusFailed     Status = "failed"
+	StatusDead       Status = "dead_letter"
+)
+
+// Task is the unit of work enqueued onto the queue.
+type Task struct {
+	ID          string          `json:"id"`
+	Type        string          `json:"type"`
+	Payload     json.RawMessage `json:"payload"`
+	Attempts    int             `json:"attempts"`
+	MaxRetries  int             `json:"max_retries"`
+	CreatedAt   time.Time       `json:"created_at"`
+	LastError   string          `json:"last_error,omitempty"`
+}
+
+// Queue wraps a Redis client with reliable-queue semantics for a named
+// queue (multiple named queues can share one Redis instance/client).
+type Queue struct {
+	rdb  *redis.Client
+	name string
+}
+
+func New(rdb *redis.Client, name string) *Queue {
+	return &Queue{rdb: rdb, name: name}
+}
+
+// Enqueue adds a new task to the pending list and returns its generated ID.
+func (q *Queue) Enqueue(ctx context.Context, taskType string, payload any, maxRetries int) (string, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal payload: %w", err)
+	}
+
+	task := Task{
+		ID:         uuid.NewString(),
+		Type:       taskType,
+		Payload:    raw,
+		MaxRetries: maxRetries,
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	data, err := json.Marshal(task)
+	if err != nil {
+		return "", fmt.Errorf("marshal task: %w", err)
+	}
+
+	pipe := q.rdb.TxPipeline()
+	pipe.LPush(ctx, q.pendingKey(), data)
+	pipe.HIncrBy(ctx, statsKey, "enqueued", 1)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return "", fmt.Errorf("enqueue: %w", err)
+	}
+
+	return task.ID, nil
+}
+
+// Dequeue atomically moves one task from the pending list to this worker's
+// processing list and returns it. Returns (nil, nil) if nothing is ready
+// within the timeout (non-blocking callers should pass a small timeout).
+func (q *Queue) Dequeue(ctx context.Context, workerID string, timeout time.Duration) (*Task, error) {
+	// First, promote any delayed (retry) tasks whose time has come.
+	if err := q.promoteDelayed(ctx); err != nil {
+		return nil, err
+	}
+
+	result, err := q.rdb.BRPopLPush(ctx, q.pendingKey(), q.processingKey(workerID), timeout).Result()
+	if err == redis.Nil {
+		return nil, nil // nothing ready — not an error
+	}
+	if err != nil {
+		return nil, fmt.Errorf("dequeue: %w", err)
+	}
+
+	var task Task
+	if err := json.Unmarshal([]byte(result), &task); err != nil {
+		return nil, fmt.Errorf("unmarshal task: %w", err)
+	}
+	return &task, nil
+}
+
+// Ack removes a successfully processed task from the worker's processing
+// list and increments the completed counter.
+func (q *Queue) Ack(ctx context.Context, workerID string, task *Task) error {
+	data, err := json.Marshal(task)
+	if err != nil {
+		return err
+	}
+	pipe := q.rdb.TxPipeline()
+	pipe.LRem(ctx, q.processingKey(workerID), 1, data)
+	pipe.HIncrBy(ctx, statsKey, "completed", 1)
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+// Nack handles a failed task: if retries remain, it schedules the task for
+// a delayed retry with exponential backoff; otherwise it moves the task to
+// the dead-letter queue.
+func (q *Queue) Nack(ctx context.Context, workerID string, task *Task, taskErr error) error {
+	old, err := json.Marshal(task)
+	if err != nil {
+		return err
+	}
+
+	task.Attempts++
+	task.LastError = taskErr.Error()
+
+	pipe := q.rdb.TxPipeline()
+	pipe.LRem(ctx, q.processingKey(workerID), 1, old)
+
+	if task.Attempts > task.MaxRetries {
+		data, _ := json.Marshal(task)
+		pipe.LPush(ctx, deadLetterKey, data)
+		pipe.HIncrBy(ctx, statsKey, "dead_letter", 1)
+	} else {
+		delay := backoffDelay(task.Attempts)
+		data, _ := json.Marshal(task)
+		pipe.ZAdd(ctx, delayedKey, redis.Z{
+			Score:  float64(time.Now().Add(delay).Unix()),
+			Member: data,
+		})
+		pipe.HIncrBy(ctx, statsKey, "failed", 1)
+	}
+
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+// promoteDelayed moves any delayed tasks whose retry time has arrived back
+// onto the pending list, ready to be dequeued again.
+func (q *Queue) promoteDelayed(ctx context.Context) error {
+	now := float64(time.Now().Unix())
+	ready, err := q.rdb.ZRangeByScore(ctx, delayedKey, &redis.ZRangeBy{
+		Min: "-inf",
+		Max: fmt.Sprintf("%f", now),
+	}).Result()
+	if err != nil {
+		return err
+	}
+
+	for _, item := range ready {
+		pipe := q.rdb.TxPipeline()
+		pipe.ZRem(ctx, delayedKey, item)
+		pipe.LPush(ctx, q.pendingKey(), item)
+		if _, err := pipe.Exec(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Stats returns aggregate counters for observability endpoints/dashboards.
+type Stats struct {
+	Enqueued     int64 `json:"enqueued"`
+	Completed    int64 `json:"completed"`
+	Failed       int64 `json:"failed"`
+	DeadLetter   int64 `json:"dead_letter"`
+	PendingDepth int64 `json:"pending_depth"`
+	DelayedDepth int64 `json:"delayed_depth"`
+}
+
+func (q *Queue) Stats(ctx context.Context) (Stats, error) {
+	vals, err := q.rdb.HGetAll(ctx, statsKey).Result()
+	if err != nil {
+		return Stats{}, err
+	}
+
+	pendingDepth, err := q.rdb.LLen(ctx, q.pendingKey()).Result()
+	if err != nil {
+		return Stats{}, err
+	}
+	delayedDepth, err := q.rdb.ZCard(ctx, delayedKey).Result()
+	if err != nil {
+		return Stats{}, err
+	}
+
+	get := func(k string) int64 {
+		var v int64
+		fmt.Sscanf(vals[k], "%d", &v)
+		return v
+	}
+
+	return Stats{
+		Enqueued:     get("enqueued"),
+		Completed:    get("completed"),
+		Failed:       get("failed"),
+		DeadLetter:   get("dead_letter"),
+		PendingDepth: pendingDepth,
+		DelayedDepth: delayedDepth,
+	}, nil
+}
+
+func (q *Queue) pendingKey() string {
+	return fmt.Sprintf(pendingKeyFmt, q.name)
+}
+
+func (q *Queue) processingKey(workerID string) string {
+	return fmt.Sprintf(processingKeyFmt, q.name, workerID)
+}
+
+// backoffDelay computes exponential backoff (1s, 2s, 4s, 8s... capped at 60s).
+func backoffDelay(attempt int) time.Duration {
+	seconds := math.Min(math.Pow(2, float64(attempt)), 60)
+	return time.Duration(seconds) * time.Second
+}
