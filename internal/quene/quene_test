@@ -1,0 +1,200 @@
+package queue
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+)
+
+func setup(t *testing.T) (*Queue, *miniredis.Miniredis, *redis.Client) {
+	t.Helper()
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	t.Cleanup(mr.Close)
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	return New(rdb, "test"), mr, rdb
+}
+
+func TestEnqueueDequeue(t *testing.T) {
+	q, _, _ := setup(t)
+	ctx := context.Background()
+
+	id, err := q.Enqueue(ctx, "greet", map[string]string{"name": "world"}, 3)
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected non-empty task ID")
+	}
+
+	task, err := q.Dequeue(ctx, "worker-1", time.Second)
+	if err != nil {
+		t.Fatalf("dequeue failed: %v", err)
+	}
+	if task == nil {
+		t.Fatal("expected a task, got nil")
+	}
+	if task.ID != id {
+		t.Errorf("expected task ID %s, got %s", id, task.ID)
+	}
+	if task.Type != "greet" {
+		t.Errorf("expected type 'greet', got %s", task.Type)
+	}
+}
+
+func TestDequeueEmptyReturnsNil(t *testing.T) {
+	q, _, _ := setup(t)
+	ctx := context.Background()
+
+	task, err := q.Dequeue(ctx, "worker-1", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected no error on empty queue, got: %v", err)
+	}
+	if task != nil {
+		t.Fatalf("expected nil task on empty queue, got: %+v", task)
+	}
+}
+
+func TestAckRemovesFromProcessing(t *testing.T) {
+	q, mr, _ := setup(t)
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, "job", map[string]string{}, 3)
+	task, _ := q.Dequeue(ctx, "worker-1", time.Second)
+
+	processingLen, _ := mr.List(q.processingKey("worker-1"))
+	if len(processingLen) != 1 {
+		t.Fatalf("expected 1 item in processing list before ack, got %d", len(processingLen))
+	}
+
+	if err := q.Ack(ctx, "worker-1", task); err != nil {
+		t.Fatalf("ack failed: %v", err)
+	}
+
+	after, _ := mr.List(q.processingKey("worker-1"))
+	if len(after) != 0 {
+		t.Fatalf("expected 0 items in processing list after ack, got %d", len(after))
+	}
+
+	stats, err := q.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats failed: %v", err)
+	}
+	if stats.Completed != 1 {
+		t.Errorf("expected completed=1, got %d", stats.Completed)
+	}
+}
+
+func TestNackSchedulesRetryWithinMaxRetries(t *testing.T) {
+	q, _, _ := setup(t)
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, "job", map[string]string{}, 3)
+	task, _ := q.Dequeue(ctx, "worker-1", time.Second)
+
+	if err := q.Nack(ctx, "worker-1", task, errors.New("boom")); err != nil {
+		t.Fatalf("nack failed: %v", err)
+	}
+
+	stats, _ := q.Stats(ctx)
+	if stats.DelayedDepth != 1 {
+		t.Errorf("expected 1 delayed task after nack within retry budget, got %d", stats.DelayedDepth)
+	}
+	if stats.DeadLetter != 0 {
+		t.Errorf("expected 0 dead-lettered tasks, got %d", stats.DeadLetter)
+	}
+}
+
+func TestNackDeadLettersAfterMaxRetries(t *testing.T) {
+	q, _, _ := setup(t)
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, "job", map[string]string{}, 1) // maxRetries=1
+	task, _ := q.Dequeue(ctx, "worker-1", time.Second)
+
+	// First failure: attempts becomes 1, still <= maxRetries(1) -> retry scheduled.
+	if err := q.Nack(ctx, "worker-1", task, errors.New("fail 1")); err != nil {
+		t.Fatalf("nack failed: %v", err)
+	}
+
+	stats, _ := q.Stats(ctx)
+	if stats.DelayedDepth != 1 {
+		t.Fatalf("expected task scheduled for retry, got delayed depth %d", stats.DelayedDepth)
+	}
+
+	// Simulate the retry being picked up again and failing a second time.
+	task.Attempts = 1 // reflects state after first Nack
+	if err := q.Nack(ctx, "worker-1", task, errors.New("fail 2")); err != nil {
+		t.Fatalf("second nack failed: %v", err)
+	}
+
+	stats, _ = q.Stats(ctx)
+	if stats.DeadLetter != 1 {
+		t.Errorf("expected task to be dead-lettered after exceeding max retries, got dead_letter=%d", stats.DeadLetter)
+	}
+}
+
+func TestPromoteDelayedMovesReadyTasksBackToPending(t *testing.T) {
+	q, _, rdb := setup(t)
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, "job", map[string]string{}, 3)
+	task, _ := q.Dequeue(ctx, "worker-1", time.Second)
+	_ = q.Nack(ctx, "worker-1", task, errors.New("transient"))
+
+	// The Nack call schedules the retry using a real wall-clock delay
+	// (via time.Now()), which miniredis's FastForward cannot influence
+	// since that's Go application logic, not a Redis TTL. To test
+	// promotion deterministically, rewrite the scheduled score directly
+	// to a moment in the past, simulating "the retry delay has elapsed".
+	members, err := rdb.ZRangeWithScores(ctx, delayedKey, 0, -1).Result()
+	if err != nil || len(members) == 0 {
+		t.Fatalf("expected one delayed member, got %v (err=%v)", members, err)
+	}
+	for _, z := range members {
+		if err := rdb.ZRem(ctx, delayedKey, z.Member).Err(); err != nil {
+			t.Fatalf("zrem failed: %v", err)
+		}
+		pastScore := float64(time.Now().Add(-time.Minute).Unix())
+		if err := rdb.ZAdd(ctx, delayedKey, redis.Z{Score: pastScore, Member: z.Member}).Err(); err != nil {
+			t.Fatalf("zadd failed: %v", err)
+		}
+	}
+
+	promoted, err := q.Dequeue(ctx, "worker-1", time.Second)
+	if err != nil {
+		t.Fatalf("dequeue after promotion failed: %v", err)
+	}
+	if promoted == nil {
+		t.Fatal("expected the retried task to be promoted back to pending and dequeued")
+	}
+}
+
+func TestStatsReflectsPendingDepth(t *testing.T) {
+	q, _, _ := setup(t)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		_, _ = q.Enqueue(ctx, "job", map[string]int{"i": i}, 3)
+	}
+
+	stats, err := q.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats failed: %v", err)
+	}
+	if stats.PendingDepth != 3 {
+		t.Errorf("expected pending depth 3, got %d", stats.PendingDepth)
+	}
+	if stats.Enqueued != 3 {
+		t.Errorf("expected enqueued counter 3, got %d", stats.Enqueued)
+	}
+}
